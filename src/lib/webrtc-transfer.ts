@@ -72,21 +72,9 @@ export function getIceConfig(): RTCConfiguration {
 }
 
 function lowerRelayPriority(candStr: string, isHostCandidateDetected: boolean = false): string {
-  try {
-    if (!candStr) return candStr;
-    const parts = candStr.split(" ");
-    if (parts.length > 3) {
-      if (candStr.includes("typ relay")) {
-        parts[3] = "1"; // set priority field to 1
-      } else if (isHostCandidateDetected && candStr.includes("typ srflx")) {
-        parts[3] = "10"; // Lower STUN priority when host candidate is detected
-      }
-    }
-    return parts.join(" ");
-  } catch (e) {
-    console.error("Failed to lower non-host priority", e);
-    return candStr;
-  }
+  // Avoid modifying external candidate priority fields, as modern mobile and strict browser engines
+  // reject tampered candidate strings with invalid format/checksum errors.
+  return candStr;
 }
 
 const CHUNK_SIZE = 16 * 1024;
@@ -1024,6 +1012,10 @@ export function startReceiver(
             stopHelloInterval();
             events.onActivity?.();
           };
+          if (dc.readyState === "open") {
+            stopHelloInterval();
+            events.onActivity?.();
+          }
         };
         await pc.setRemoteDescription(payload.sdp);
         remoteDescriptionSet = true;
@@ -1125,6 +1117,7 @@ export function startReceiver(
 
   async function handleMessage(data: string | ArrayBuffer) {
     if (cancelled || !dc) return;
+    stopHelloInterval(); // Proactively stop the signaling hello loop when we start receiving actual data channel traffic!
     if (typeof data === "string") {
       let msg: {
         kind: string;
