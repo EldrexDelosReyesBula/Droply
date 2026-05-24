@@ -71,6 +71,19 @@ export function getIceConfig(): RTCConfiguration {
   return ICE;
 }
 
+function lowerRelayPriority(candStr: string): string {
+  try {
+    const parts = candStr.split(" ");
+    if (parts.length > 3) {
+      parts[3] = "1"; // set priority field to 1
+    }
+    return parts.join(" ");
+  } catch (e) {
+    console.error("Failed to lower relay priority", e);
+    return candStr;
+  }
+}
+
 const CHUNK_SIZE = 16 * 1024;
 const HIGH_WATERMARK = 1 * 1024 * 1024;
 const BACKPRESSURE_THRESHOLD = 4 * 1024 * 1024; // Pause threshold (4MB) to prevent mobile/safari memory crash
@@ -227,6 +240,7 @@ export function startSender(shareId: string, file: File, events: SenderEvents = 
   let currentStreamSession = 0;
   const earlyIceCandidates = new Map<string, RTCIceCandidateInit[]>();
   let remoteDescriptionSet = false;
+  let hasHostCandidate = false;
   let statsInterval: ReturnType<typeof setInterval> | null = null;
   let lastProgressAt = Date.now();
   let lastProgressBytes = 0;
@@ -308,6 +322,7 @@ export function startSender(shareId: string, file: File, events: SenderEvents = 
     await ensureKeys();
     iceQueue.length = 0;
     remoteDescriptionSet = false;
+    hasHostCandidate = false;
     stopStatsMonitoring();
     lastProgressAt = Date.now();
     lastProgressBytes = 0;
@@ -329,7 +344,22 @@ export function startSender(shareId: string, file: File, events: SenderEvents = 
     dc.bufferedAmountLowThreshold = HIGH_WATERMARK; // fire events when it drops below 1MB
 
     pc.onicecandidate = (e) => {
-      if (e.candidate) send("ice", { from: "sender", candidate: e.candidate, pcId });
+      if (e.candidate) {
+        let candStr = e.candidate.candidate;
+        if (candStr && candStr.includes("typ host")) {
+          hasHostCandidate = true;
+        }
+        if (hasHostCandidate && candStr && candStr.includes("typ relay")) {
+          candStr = lowerRelayPriority(candStr);
+        }
+        const candidateInit: RTCIceCandidateInit = {
+          candidate: candStr,
+          sdpMid: e.candidate.sdpMid,
+          sdpMLineIndex: e.candidate.sdpMLineIndex,
+          usernameFragment: e.candidate.usernameFragment,
+        };
+        send("ice", { from: "sender", candidate: candidateInit, pcId });
+      }
     };
     const logStates = (eventSource: string) => {
       console.log(`[WebRTC Sender ${pcId}] Event: ${eventSource}`, {
@@ -618,7 +648,18 @@ export function startSender(shareId: string, file: File, events: SenderEvents = 
 
         // Unified early candidates buffer processing
         const queuedEarly = earlyIceCandidates.get(payload.pcId) ?? [];
-        for (const cand of queuedEarly) {
+        for (let cand of queuedEarly) {
+          if (cand && cand.candidate) {
+            if (cand.candidate.includes("typ host")) {
+              hasHostCandidate = true;
+            }
+            if (hasHostCandidate && cand.candidate.includes("typ relay")) {
+              cand = {
+                ...cand,
+                candidate: lowerRelayPriority(cand.candidate),
+              };
+            }
+          }
           await pc
             .addIceCandidate(new RTCIceCandidate(cand))
             .catch((e) => console.warn("Buffered early ice error", e));
@@ -626,8 +667,19 @@ export function startSender(shareId: string, file: File, events: SenderEvents = 
         earlyIceCandidates.delete(payload.pcId);
 
         while (iceQueue.length > 0) {
-          const cand = iceQueue.shift();
+          let cand = iceQueue.shift();
           if (cand) {
+            if (cand.candidate) {
+              if (cand.candidate.includes("typ host")) {
+                hasHostCandidate = true;
+              }
+              if (hasHostCandidate && cand.candidate.includes("typ relay")) {
+                cand = {
+                  ...cand,
+                  candidate: lowerRelayPriority(cand.candidate),
+                };
+              }
+            }
             await pc
               .addIceCandidate(new RTCIceCandidate(cand))
               .catch((e) => console.warn("Queued ice error description set", e));
@@ -642,9 +694,22 @@ export function startSender(shareId: string, file: File, events: SenderEvents = 
       const pcId = payload.pcId;
       if (!pcId) return;
 
+      let cand = payload.candidate;
+      if (cand && cand.candidate) {
+        if (cand.candidate.includes("typ host")) {
+          hasHostCandidate = true;
+        }
+        if (hasHostCandidate && cand.candidate.includes("typ relay")) {
+          cand = {
+            ...cand,
+            candidate: lowerRelayPriority(cand.candidate),
+          };
+        }
+      }
+
       if (pcId === currentPcId && pc && remoteDescriptionSet) {
         try {
-          await pc.addIceCandidate(new RTCIceCandidate(payload.candidate));
+          await pc.addIceCandidate(new RTCIceCandidate(cand));
         } catch {
           void 0;
         }
@@ -654,7 +719,7 @@ export function startSender(shareId: string, file: File, events: SenderEvents = 
           q = [];
           earlyIceCandidates.set(pcId, q);
         }
-        q.push(payload.candidate);
+        q.push(cand);
       }
     })
     .subscribe();
@@ -736,6 +801,7 @@ export function startReceiver(
   const chunkHashes = new Map<number, string>();
   const chunkRetries = new Map<number, number>();
   let remoteDescriptionSet = false;
+  let hasHostCandidate = false;
   let statsInterval: ReturnType<typeof setInterval> | null = null;
   let lastProgressAt = Date.now();
   let lastProgressBytes = 0;
@@ -876,9 +942,25 @@ export function startReceiver(
         teardownPc();
         iceQueue.length = 0;
         remoteDescriptionSet = false;
+        hasHostCandidate = false;
         pc = new RTCPeerConnection(getIceConfig());
         pc.onicecandidate = (e) => {
-          if (e.candidate) send("ice", { from: "receiver", candidate: e.candidate, pcId });
+          if (e.candidate) {
+            let candStr = e.candidate.candidate;
+            if (candStr && candStr.includes("typ host")) {
+              hasHostCandidate = true;
+            }
+            if (hasHostCandidate && candStr && candStr.includes("typ relay")) {
+              candStr = lowerRelayPriority(candStr);
+            }
+            const candidateInit: RTCIceCandidateInit = {
+              candidate: candStr,
+              sdpMid: e.candidate.sdpMid,
+              sdpMLineIndex: e.candidate.sdpMLineIndex,
+              usernameFragment: e.candidate.usernameFragment,
+            };
+            send("ice", { from: "receiver", candidate: candidateInit, pcId });
+          }
         };
         const logReceiverStates = (eventSource: string) => {
           console.log(`[WebRTC Receiver ${pcId}] Event: ${eventSource}`, {
@@ -928,7 +1010,18 @@ export function startReceiver(
 
         // Unified early candidates buffer processing
         const queuedEarly = earlyIceCandidates.get(pcId) ?? [];
-        for (const cand of queuedEarly) {
+        for (let cand of queuedEarly) {
+          if (cand && cand.candidate) {
+            if (cand.candidate.includes("typ host")) {
+              hasHostCandidate = true;
+            }
+            if (hasHostCandidate && cand.candidate.includes("typ relay")) {
+              cand = {
+                ...cand,
+                candidate: lowerRelayPriority(cand.candidate),
+              };
+            }
+          }
           await pc
             .addIceCandidate(new RTCIceCandidate(cand))
             .catch((e) => console.warn("Buffered early ice error receiver", e));
@@ -936,8 +1029,19 @@ export function startReceiver(
         earlyIceCandidates.delete(pcId);
 
         while (iceQueue.length > 0) {
-          const cand = iceQueue.shift();
+          let cand = iceQueue.shift();
           if (cand) {
+            if (cand.candidate) {
+              if (cand.candidate.includes("typ host")) {
+                hasHostCandidate = true;
+              }
+              if (hasHostCandidate && cand.candidate.includes("typ relay")) {
+                cand = {
+                  ...cand,
+                  candidate: lowerRelayPriority(cand.candidate),
+                };
+              }
+            }
             await pc
               .addIceCandidate(new RTCIceCandidate(cand))
               .catch((e) => console.warn("Queued ice error receiver descript set", e));
@@ -955,9 +1059,22 @@ export function startReceiver(
       const pcId = payload.pcId;
       if (!pcId) return;
 
+      let cand = payload.candidate;
+      if (cand && cand.candidate) {
+        if (cand.candidate.includes("typ host")) {
+          hasHostCandidate = true;
+        }
+        if (hasHostCandidate && cand.candidate.includes("typ relay")) {
+          cand = {
+            ...cand,
+            candidate: lowerRelayPriority(cand.candidate),
+          };
+        }
+      }
+
       if (pcId === currentPcId && pc && remoteDescriptionSet) {
         try {
-          await pc.addIceCandidate(new RTCIceCandidate(payload.candidate));
+          await pc.addIceCandidate(new RTCIceCandidate(cand));
         } catch {
           void 0;
         }
@@ -967,7 +1084,7 @@ export function startReceiver(
           q = [];
           earlyIceCandidates.set(pcId, q);
         }
-        q.push(payload.candidate);
+        q.push(cand);
       }
     })
     .subscribe((status) => {
